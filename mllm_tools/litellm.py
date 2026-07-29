@@ -148,8 +148,37 @@ class LiteLLMWrapper:
                         })
                     else:
                         raise ValueError("For GPT, only text and image inferencing are supported")
+                elif "minimax" in self.model_name.lower():
+                    # MiniMax uses the OpenAI-compatible content schema and
+                    # supports both image and video inputs.
+                    if msg["type"] == "image":
+                        formatted_messages.append({
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": data_url
+                                    }
+                                }
+                            ]
+                        })
+                    elif msg["type"] == "video":
+                        formatted_messages.append({
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "video_url",
+                                    "video_url": {
+                                        "url": data_url
+                                    }
+                                }
+                            ]
+                        })
+                    else:
+                        raise ValueError("For MiniMax, only text, image and video inferencing are supported")
                 else:
-                    raise ValueError("Only support Gemini and Gpt for Multimodal capability now")
+                    raise ValueError("Only support Gemini, Gpt and MiniMax for Multimodal capability now")
 
         try:
             # if it's openai o series model, set temperature to None and reasoning_effort to "medium"
