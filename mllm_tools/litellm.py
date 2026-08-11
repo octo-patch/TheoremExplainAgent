@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+MINIMAX_MULTIMODAL_MODELS = {"minimax/minimax-m3"}
+
+
 class LiteLLMWrapper:
     """Wrapper for LiteLLM to support multiple models and logging"""
     
@@ -148,9 +151,11 @@ class LiteLLMWrapper:
                         })
                     else:
                         raise ValueError("For GPT, only text and image inferencing are supported")
-                elif "minimax" in self.model_name.lower():
-                    # MiniMax uses the OpenAI-compatible content schema and
-                    # supports both image and video inputs.
+                elif self.model_name.lower().startswith("minimax/"):
+                    if self.model_name.lower() not in MINIMAX_MULTIMODAL_MODELS:
+                        raise ValueError(f"{self.model_name} only supports text input")
+
+                    # MiniMax-M3 uses OpenAI-compatible image and video blocks.
                     if msg["type"] == "image":
                         formatted_messages.append({
                             "role": "user",
