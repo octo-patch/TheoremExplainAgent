@@ -1,148 +1,133 @@
+"""Offline tests using real LiteLLM/OpenAI serialization, never live inference.
+
+Run with the versions from requirements.txt. Only HTTP transport is replaced
+for the request tests; legacy passthrough is separately a wrapper unit test.
+"""
+import argparse
+import ast
 import json
-import sys
-import types
+import os
+from pathlib import Path
+import socket
 import unittest
-from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import patch
 
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+import httpx
+import litellm
 
-class MockHTTPTransport:
-    """Capture the JSON body that a provider SDK would send over HTTP."""
-
-    def __init__(self):
-        self.payload = None
-
-    def post(self, body):
-        self.payload = json.loads(json.dumps(body))
-        return {"choices": [{"message": {"content": "ok"}}]}
-
-
-transport = MockHTTPTransport()
-fake_litellm = types.ModuleType("litellm")
-
-
-def completion(**kwargs):
-    body = {
-        key: kwargs[key]
-        for key in ("model", "messages", "temperature")
-        if key in kwargs
-    }
-    response = transport.post(body)
-    return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=response["choices"][0]["message"]["content"]))]
-    )
-
-
-fake_litellm.completion = completion
-fake_litellm.completion_cost = Mock(return_value=0)
-fake_litellm.success_callback = []
-fake_litellm.failure_callback = []
-sys.modules["litellm"] = fake_litellm
-
-fake_dotenv = types.ModuleType("dotenv")
-fake_dotenv.load_dotenv = Mock()
-sys.modules["dotenv"] = fake_dotenv
-
-from mllm_tools.litellm import LiteLLMWrapper  # noqa: E402
-
-
-class FakeGeminiWrapper:
-    def __init__(self, model_name, temperature):
-        self.model_name = model_name
-        self.temperature = temperature
-
-
-fake_moviepy = types.ModuleType("moviepy")
-fake_moviepy.VideoFileClip = object
-sys.modules["moviepy"] = fake_moviepy
-
-fake_gemini = types.ModuleType("mllm_tools.gemini")
-fake_gemini.GeminiWrapper = FakeGeminiWrapper
-sys.modules["mllm_tools.gemini"] = fake_gemini
-
-fake_eval_utils = types.ModuleType("eval_suite.utils")
-fake_eval_utils.calculate_geometric_mean = Mock()
-sys.modules["eval_suite.utils"] = fake_eval_utils
-
-fake_text_utils = types.ModuleType("eval_suite.text_utils")
-fake_text_utils.parse_srt_to_text = Mock()
-fake_text_utils.fix_transcript = Mock()
-fake_text_utils.evaluate_text = Mock()
-sys.modules["eval_suite.text_utils"] = fake_text_utils
-
-fake_video_utils = types.ModuleType("eval_suite.video_utils")
-fake_video_utils.evaluate_video_chunk_new = Mock()
-sys.modules["eval_suite.video_utils"] = fake_video_utils
-
-fake_image_utils = types.ModuleType("eval_suite.image_utils")
-fake_image_utils.evaluate_sampled_images = Mock()
-sys.modules["eval_suite.image_utils"] = fake_image_utils
-
-import evaluate  # noqa: E402
+# Do not load developer credentials from .env during test imports.
+with patch("dotenv.load_dotenv"):
+    from mllm_tools.litellm import LiteLLMWrapper
 
 
 class MiniMaxTextBoundaryTest(unittest.TestCase):
+    def enterContext(self, context):
+        value = context.__enter__()
+        self.addCleanup(context.__exit__, None, None, None)
+        return value
+
     def setUp(self):
-        transport.payload = None
+        self.requests = []
+        self.enterContext(patch.dict(os.environ, {
+            "MINIMAX_API_KEY": "fixture-minimax-key",
+            "OPENAI_API_KEY": "fixture-openai-key",
+        }, clear=True))
+        self.enterContext(patch.object(socket.socket, "connect", side_effect=AssertionError("Network forbidden")))
+        self.enterContext(patch.object(httpx.HTTPTransport, "handle_request", self.capture))
+        litellm.success_callback = []
+        litellm.failure_callback = []
+        litellm.telemetry = False
 
-    def test_catalog_orders_flash_before_m3(self):
-        self.assertEqual(
-            evaluate.ALLOWED_MODELS[-2:],
-            ["minimax/MiniMax-M3.1-Flash", "minimax/MiniMax-M3"],
-        )
-        self.assertEqual(evaluate.DEFAULT_TEXT_MODEL, "minimax/MiniMax-M3.1-Flash")
+    def capture(self, request):
+        self.requests.append(request)
+        return httpx.Response(200, request=request, json={
+            "id": "chatcmpl-fixture", "object": "chat.completion", "created": 1,
+            "model": json.loads(request.content)["model"],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        })
 
-    def test_flash_text_payload_reaches_mock_http_boundary(self):
-        model = LiteLLMWrapper(
-            model_name="minimax/MiniMax-M3.1-Flash",
-            temperature=0.0,
-            use_langfuse=False,
-        )
+    def call(self, model, messages=None, temperature=0.0):
+        wrapper = LiteLLMWrapper(model_name=model, temperature=temperature, use_langfuse=False)
+        result = wrapper(messages or [{"type": "text", "content": "hello"}], metadata={})
+        self.assertEqual(result, "ok")
+        request = self.requests[-1]
+        self.assertEqual(request.method, "POST")
+        return request, json.loads(request.content)
 
-        self.assertEqual(model([{"type": "text", "content": "hello"}]), "ok")
-        self.assertEqual(
-            transport.payload,
-            {
-                "model": "minimax/MiniMax-M3.1-Flash",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [{"type": "text", "text": "hello"}],
-                    }
-                ],
-                "temperature": 0.0,
-            },
-        )
+    def test_catalog_order(self):
+        catalog = json.loads((Path(__file__).resolve().parents[1] / "src/utils/allowed_models.json").read_text())
+        self.assertEqual([m for m in catalog["allowed_models"] if m.startswith("minimax/")],
+                         ["minimax/MiniMax-M3.1-Flash", "minimax/MiniMax-M3"])
 
-    def test_m3_text_payload_is_available_without_changing_non_minimax_shape(self):
-        model = LiteLLMWrapper(
-            model_name="minimax/MiniMax-M3",
-            temperature=0.0,
-            use_langfuse=False,
-        )
+    def test_evaluation_cli_default_reaches_http(self):
+        # Execute the actual parser statements without importing media/ML stacks.
+        root = Path(__file__).resolve().parents[1]
+        tree = ast.parse((root / "evaluate.py").read_text())
+        default = next(n for n in tree.body if isinstance(n, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == "DEFAULT_TEXT_MODEL" for t in n.targets))
+        main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+        statements = [default]
+        for node in main.body:
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "args" for t in node.targets):
+                break
+            statements.append(node)
+        namespace = {"argparse": argparse, "ALLOWED_MODELS": json.loads((root / "src/utils/allowed_models.json").read_text())["allowed_models"]}
+        exec(compile(ast.Module(body=statements, type_ignores=[]), "evaluate.py", "exec"), namespace)
+        args = namespace["parser"].parse_args(["--file_path", "fixture.txt", "--output_folder", "unused", "--eval_type", "text"])
+        _, body = self.call(args.model_text)
+        self.assertEqual(body["model"], "MiniMax-M3.1-Flash")
+        self.assertEqual(args.model_image, "azure/gpt-4o")
+        self.assertEqual(args.model_video, "gemini/gemini-1.5-pro-002")
 
-        self.assertEqual(model([{"type": "text", "content": "m3"}]), "ok")
-        self.assertEqual(transport.payload["model"], "minimax/MiniMax-M3")
-        self.assertEqual(transport.payload["messages"][0]["content"][0]["type"], "text")
+    def test_flash_actual_http_serialization(self):
+        request, body = self.call("minimax/MiniMax-M3.1-Flash")
+        self.assertEqual(str(request.url), "https://api.minimax.io/v1/chat/completions")
+        self.assertEqual(request.headers["authorization"], "Bearer fixture-minimax-key")
+        self.assertEqual(body["model"], "MiniMax-M3.1-Flash")
+        self.assertEqual(body["messages"], [{"role": "user", "content": [{"type": "text", "text": "hello"}]}])
+        for key in ("temperature", "thinking", "reasoning_effort", "service_tier", "reasoning_split"):
+            self.assertNotIn(key, body)  # Provider defaults: adaptive thinking/max effort.
 
-        model = LiteLLMWrapper(
-            model_name="gpt-4o",
-            temperature=0.0,
-            use_langfuse=False,
-        )
-        self.assertEqual(model([{"type": "text", "content": "gpt"}]), "ok")
-        self.assertEqual(transport.payload["model"], "gpt-4o")
-        self.assertEqual(transport.payload["messages"][0]["content"][0]["text"], "gpt")
+    def test_m3_preserves_explicit_model_and_temperature(self):
+        _, body = self.call("minimax/MiniMax-M3", temperature=0.7)
+        self.assertEqual(body["model"], "MiniMax-M3")
+        self.assertEqual(body["temperature"], 0.7)
 
-    def test_explicit_legacy_minimax_text_request_remains_accepted(self):
-        model = LiteLLMWrapper(
-            model_name="minimax/MiniMax-M2.7",
-            temperature=0.0,
-            use_langfuse=False,
-        )
+    def test_custom_and_regional_endpoint_overrides(self):
+        for base in ("https://api.minimaxi.com/v1", "https://custom.example/compatible/v1"):
+            with self.subTest(base=base), patch.dict(os.environ, {"MINIMAX_API_BASE": base}):
+                request, body = self.call("minimax/MiniMax-M3.1-Flash")
+                self.assertEqual(str(request.url), base + "/chat/completions")
+                self.assertEqual(body["model"], "MiniMax-M3.1-Flash")
 
-        self.assertEqual(model([{"type": "text", "content": "legacy"}]), "ok")
-        self.assertEqual(transport.payload["model"], "minimax/MiniMax-M2.7")
+    def test_missing_minimax_key_never_falls_back_to_openai(self):
+        os.environ.pop("MINIMAX_API_KEY")
+        wrapper = LiteLLMWrapper(model_name="minimax/MiniMax-M3", use_langfuse=False)
+        result = wrapper([{"type": "text", "content": "hello"}], metadata={})
+        self.assertIn("MINIMAX_API_KEY is required", result)
+        self.assertEqual(self.requests, [])
+
+    def test_non_minimax_image_payload_is_preserved(self):
+        request, body = self.call("gpt-4o", [{"type": "image", "content": "https://example.com/image.png"}])
+        self.assertEqual(str(request.url), "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(body["model"], "gpt-4o")
+        self.assertEqual(body["temperature"], 0.0)
+        self.assertEqual(body["messages"][0]["content"], [{"type": "image_url", "image_url": {"url": "https://example.com/image.png", "detail": "high"}}])
+
+    def test_legacy_and_custom_ids_are_passed_through_unit_only(self):
+        for model in ("minimax/MiniMax-M2.7", "openai/custom-saved-model"):
+            with self.subTest(model=model), patch("mllm_tools.litellm.completion") as completion:
+                LiteLLMWrapper(model_name=model, use_langfuse=False)([{"type": "text", "content": "legacy"}], metadata={})
+                self.assertEqual(completion.call_args.kwargs["model"], model)
+                self.assertNotIn("api_base", completion.call_args.kwargs)
+
+    def test_minimax_media_still_rejected_before_http(self):
+        wrapper = LiteLLMWrapper(model_name="minimax/MiniMax-M3", use_langfuse=False)
+        with self.assertRaisesRegex(ValueError, "Multimodal capability"):
+            wrapper([{"type": "video", "content": "https://example.com/video.mp4"}], metadata={})
+        self.assertEqual(self.requests, [])
 
 
 if __name__ == "__main__":
